@@ -1,0 +1,65 @@
+{
+  "name": "Error Handler → Telegram Alerts",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## 🚨 Centralized error handler\n\nЛюбой workflow в инстансе, у которого в Settings → Error Workflow выбран этот воркфлоу, при падении дёрнет нас.\n\nМы:\n1. Берём метаданные исполнения (workflow id/name, node, error, execution URL)\n2. Форматируем красивое сообщение с трассировкой\n3. Постим в Telegram-канал DevOps команды\n4. Дополнительно — пишем в Postgres `error_log` для последующего анализа (опционально)\n\nКлиент отдельно настраивает в каждом проде workflow:\n→ Settings → Error Workflow → выбирает этот.",
+        "height": 300,
+        "width": 460,
+        "color": 2
+      },
+      "id": "note",
+      "name": "Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-100, -120]
+    },
+    {
+      "parameters": {},
+      "id": "trig",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [-100, 280]
+    },
+    {
+      "parameters": {
+        "jsCode": "const e = items[0].json;\nconst exec = e.execution || {};\nconst err = e.execution?.error || e.error || {};\nconst wf = e.workflow || {};\n\nconst lines = [\n  `🚨 *n8n workflow failed*`,\n  ``,\n  `*Workflow:* ${wf.name || 'unknown'} (\\`${wf.id || '?'}\\`)`,\n  `*Failed node:* \\`${err.node?.name || '?'}\\` (${err.node?.type || '?'})`,\n  `*Error:* ${err.message || String(err) || 'no message'}`,\n  ``,\n  `*Execution:* ${exec.url || `${process.env.N8N_HOST || 'n8n'}/execution/${exec.id || '?'}`}`,\n  `*Mode:* ${exec.mode || 'unknown'}`,\n  `*Time:* ${e.execution?.startedAt || $now.toISO()}`,\n];\n\nreturn [{\n  json: {\n    text: lines.join('\\n'),\n    chat_id: $env.TELEGRAM_ALERT_CHAT_ID,\n    parse_mode: 'Markdown'\n  }\n}];"
+      },
+      "id": "fmt",
+      "name": "Format Alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [120, 280]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.telegram.org/bot{{ $env.TELEGRAM_BOT_TOKEN }}/sendMessage",
+        "sendBody": true,
+        "bodyContentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ chat_id: $json.chat_id, text: $json.text, parse_mode: $json.parse_mode }) }}",
+        "options": {
+          "retry": { "maxTries": 3, "waitBetweenTries": 2000 }
+        }
+      },
+      "id": "tg",
+      "name": "Telegram: Send Alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [340, 280]
+    }
+  ],
+  "connections": {
+    "Error Trigger": { "main": [[{ "node": "Format Alert", "type": "main", "index": 0 }]] },
+    "Format Alert": { "main": [[{ "node": "Telegram: Send Alert", "type": "main", "index": 0 }]] }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1" },
+  "id": "errorhandler001",
+  "versionId": "33333333-3333-3333-3333-333333333333",
+  "meta": {},
+  "pinData": {},
+  "tags": []
+}

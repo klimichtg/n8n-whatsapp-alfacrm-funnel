@@ -1,0 +1,146 @@
+# Production-ready n8n stack:
+#   - Postgres for durable workflow/execution storage
+#   - Redis as queue backend for n8n queue mode
+#   - n8n-main: API + UI + webhook receiver
+#   - n8n-worker: scales out execution across long-running AI/follow-up jobs
+#   - Evolution API: WhatsApp gateway (HTTP -> WhatsApp Web protocol)
+#
+# Why this layout:
+#   * Webhook bursts from Evolution API (mass campaigns, viral replies) must
+#     not block AI/CRM execution. Queue mode + workers gives back-pressure.
+#   * Postgres + Redis are the only n8n combo that survives container
+#     restarts without losing executions.
+#   * Evolution API runs in the same compose stack so the WhatsApp instance
+#     can reach n8n at http://n8n-main:5678 over the docker network.
+
+x-n8n-env: &n8n-env
+  DB_TYPE: postgresdb
+  DB_POSTGRESDB_HOST: postgres
+  DB_POSTGRESDB_PORT: 5432
+  DB_POSTGRESDB_DATABASE: ${POSTGRES_DB}
+  DB_POSTGRESDB_USER: ${POSTGRES_USER}
+  DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD}
+
+  EXECUTIONS_MODE: queue
+  QUEUE_BULL_REDIS_HOST: redis
+  QUEUE_BULL_REDIS_PORT: 6379
+
+  N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+  N8N_HOST: ${N8N_HOST}
+  N8N_PORT: 5678
+  N8N_PROTOCOL: ${N8N_PROTOCOL:-http}
+  WEBHOOK_URL: ${WEBHOOK_URL}
+  GENERIC_TIMEZONE: ${TIMEZONE:-Europe/Moscow}
+  TZ: ${TIMEZONE:-Europe/Moscow}
+
+  # Forward credentials of LLM/CRM providers + Telegram + Evolution to workflow nodes
+  OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+  GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+  ALFACRM_HOSTNAME: ${ALFACRM_HOSTNAME:-}
+  ALFACRM_EMAIL: ${ALFACRM_EMAIL:-}
+  ALFACRM_API_KEY: ${ALFACRM_API_KEY:-}
+  ALFACRM_BRANCH_ID: ${ALFACRM_BRANCH_ID:-1}
+  ALFACRM_DEFAULT_LEAD_STATUS_ID: ${ALFACRM_DEFAULT_LEAD_STATUS_ID:-1}
+  ALFACRM_WHATSAPP_LEAD_SOURCE_ID: ${ALFACRM_WHATSAPP_LEAD_SOURCE_ID:-1}
+  EVOLUTION_API_KEY: ${EVOLUTION_API_KEY}
+  EVOLUTION_HMAC_KEY: ${EVOLUTION_HMAC_KEY:-}
+  EVOLUTION_INSTANCE: ${EVOLUTION_INSTANCE:-sales-bot-1}
+  TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+  TELEGRAM_SALES_CHAT_ID: ${TELEGRAM_SALES_CHAT_ID:-}
+  TELEGRAM_ALERT_CHAT_ID: ${TELEGRAM_ALERT_CHAT_ID:-}
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  n8n-main:
+    image: n8nio/n8n:latest
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      <<: *n8n-env
+      N8N_RUNNERS_ENABLED: "true"
+    ports:
+      - "${N8N_PORT:-5678}:5678"
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ./workflows:/workflows:ro
+
+  n8n-worker:
+    image: n8nio/n8n:latest
+    restart: unless-stopped
+    depends_on:
+      n8n-main:
+        condition: service_started
+      redis:
+        condition: service_healthy
+    environment:
+      <<: *n8n-env
+      N8N_RUNNERS_ENABLED: "true"
+    command: worker --concurrency=10
+    volumes:
+      - n8n_data:/home/node/.n8n
+
+  evolution-api:
+    image: atendai/evolution-api:v2.1.1
+    restart: unless-stopped
+    ports:
+      - "${EVOLUTION_PORT:-8080}:8080"
+    environment:
+      AUTHENTICATION_API_KEY: ${EVOLUTION_API_KEY}
+      DATABASE_PROVIDER: postgresql
+      DATABASE_CONNECTION_URI: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?schema=evolution_api
+      DATABASE_CONNECTION_CLIENT_NAME: evolution_exchange
+      CACHE_REDIS_ENABLED: "true"
+      CACHE_REDIS_URI: redis://redis:6379/6
+      CACHE_REDIS_PREFIX_KEY: evolution
+      CACHE_LOCAL_ENABLED: "false"
+      WEBHOOK_GLOBAL_URL: http://n8n-main:5678/webhook/evolution-incoming
+      WEBHOOK_GLOBAL_ENABLED: "true"
+      WEBHOOK_GLOBAL_WEBHOOK_BY_EVENTS: "false"
+      WEBHOOK_EVENTS_MESSAGES_UPSERT: "true"
+      WEBHOOK_EVENTS_CONNECTION_UPDATE: "true"
+      WEBHOOK_EVENTS_QRCODE_UPDATED: "true"
+      LANGUAGE: en
+    volumes:
+      - evolution_data:/evolution/instances
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  redis_data:
+  n8n_data:
+  evolution_data:

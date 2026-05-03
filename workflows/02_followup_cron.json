@@ -1,0 +1,322 @@
+{
+  "name": "WhatsApp → AlfaCRM Follow-up Campaign (Cron)",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## ⏰ Stage-based follow-up\n\nRuns every 15 minutes. For each funnel stage, fetches leads in that stage that haven't received a follow-up in N hours, and sends a templated WhatsApp message.\n\nStage cadence (default, configurable in Set node):\n- Stage 2 (in-progress, no reply): +1 hour\n- Stage 3 (qualified, awaiting decision): +24 hours\n- Stage 4 (hot, manager handoff): +3 hours, then notify manager via separate channel\n- Stage 5 (cold): no follow-up\n\nWe write the last touch timestamp into AlfaCRM's `note` or a custom field — depends on the client's CRM config. Demo uses `note`.",
+        "height": 320,
+        "width": 420,
+        "color": 7
+      },
+      "id": "note-1",
+      "name": "Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -160,
+        -80
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 15
+            }
+          ]
+        }
+      },
+      "id": "node-cron",
+      "name": "Every 15 min",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -160,
+        280
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://{{ $env.ALFACRM_HOSTNAME }}/v2api/auth/login",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/json"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyContentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"email\": \"{{ $env.ALFACRM_EMAIL }}\",\n  \"api_key\": \"{{ $env.ALFACRM_API_KEY }}\"\n}",
+        "options": {}
+      },
+      "id": "node-auth",
+      "name": "AlfaCRM: Auth",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        60,
+        280
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "s1",
+              "name": "stages",
+              "value": "={{ [{\"id\": 2, \"hoursSinceLastTouch\": 1, \"template\": \"Здравствуйте, {{name}}! Уточняю, актуален ли ещё ваш запрос? Готов ответить на любые вопросы.\"}, {\"id\": 3, \"hoursSinceLastTouch\": 24, \"template\": \"{{name}}, добрый день! Удалось ли посоветоваться по нашему предложению? Если нужно, могу прислать дополнительные материалы.\"}, {\"id\": 4, \"hoursSinceLastTouch\": 3, \"template\": \"{{name}}, передаю вас нашему менеджеру — он свяжется с вами в ближайшие минуты.\"}] }}",
+              "type": "array"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node-stages",
+      "name": "Stage Cadence Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        280,
+        280
+      ]
+    },
+    {
+      "parameters": {
+        "fieldToSplitOut": "stages",
+        "options": {}
+      },
+      "id": "node-split",
+      "name": "Split Stages",
+      "type": "n8n-nodes-base.splitOut",
+      "typeVersion": 1,
+      "position": [
+        500,
+        280
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://{{ $env.ALFACRM_HOSTNAME }}/v2api/{{ $env.ALFACRM_BRANCH_ID }}/customer/index",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/json"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "X-ALFACRM-TOKEN",
+              "value": "={{ $('AlfaCRM: Auth').item.json.token }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyContentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"lead_status_id\": {{ $json.id }},\n  \"is_study\": 0,\n  \"page\": 0\n}",
+        "options": {}
+      },
+      "id": "node-find-stale",
+      "name": "AlfaCRM: Find Stale Leads",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        720,
+        280
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Filter to leads that haven't been touched in N hours.\n// AlfaCRM returns `updated_at` and `note` fields; we use `updated_at` as a proxy.\nconst stage = $('Split Stages').item.json;\nconst threshold = stage.hoursSinceLastTouch * 3600 * 1000;\nconst now = Date.now();\nconst leads = (items[0].json.items || []).filter(c => {\n  const upd = c.updated_at ? new Date(c.updated_at).getTime() : 0;\n  return (now - upd) > threshold;\n});\n\nreturn leads.map(c => ({\n  json: {\n    customerId: c.id,\n    name: c.name,\n    phone: (c.phone && c.phone[0]) || '',\n    leadStatusId: c.lead_status_id,\n    template: stage.template.replace('{{name}}', c.name || 'друг')\n  }\n}));"
+      },
+      "id": "node-filter-stale",
+      "name": "Filter Stale Leads",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        940,
+        280
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=http://evolution-api:8080/message/sendText/{{ $env.EVOLUTION_INSTANCE }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "apikey",
+              "value": "={{ $env.EVOLUTION_API_KEY }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyContentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"number\": \"{{ $json.phone.replace('+','') }}\",\n  \"text\": {{ JSON.stringify($json.template) }}\n}",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 5,
+              "batchInterval": 2000
+            }
+          }
+        }
+      },
+      "id": "node-send",
+      "name": "Send Follow-up",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1160,
+        280
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://{{ $env.ALFACRM_HOSTNAME }}/v2api/{{ $env.ALFACRM_BRANCH_ID }}/customer/update?id={{ $json.customerId }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/json"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "X-ALFACRM-TOKEN",
+              "value": "={{ $('AlfaCRM: Auth').item.json.token }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyContentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"note\": \"Авто follow-up отправлен {{ $now.toISO() }}\"\n}",
+        "options": {}
+      },
+      "id": "node-touch",
+      "name": "Mark Touched",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1380,
+        280
+      ]
+    }
+  ],
+  "connections": {
+    "Every 15 min": {
+      "main": [
+        [
+          {
+            "node": "AlfaCRM: Auth",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AlfaCRM: Auth": {
+      "main": [
+        [
+          {
+            "node": "Stage Cadence Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Stage Cadence Config": {
+      "main": [
+        [
+          {
+            "node": "Split Stages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split Stages": {
+      "main": [
+        [
+          {
+            "node": "AlfaCRM: Find Stale Leads",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AlfaCRM: Find Stale Leads": {
+      "main": [
+        [
+          {
+            "node": "Filter Stale Leads",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter Stale Leads": {
+      "main": [
+        [
+          {
+            "node": "Send Follow-up",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Follow-up": {
+      "main": [
+        [
+          {
+            "node": "Mark Touched",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": [],
+  "id": "4277cf9fc849fbda",
+  "versionId": "7c130c15-342e-408a-b967-53519c1f874d",
+  "meta": {},
+  "pinData": {}
+}

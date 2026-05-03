@@ -1,0 +1,49 @@
+{
+  "name": "n8n-nodes-alfacrm",
+  "version": "0.1.0",
+  "description": "n8n community node for AlfaCRM REST API v2 (customer / lesson / branch / lead-source). Handles auth caching, retry, and rate-limit batching.",
+  "keywords": [
+    "n8n-community-node-package",
+    "alfacrm",
+    "crm",
+    "education-crm"
+  ],
+  "license": "MIT",
+  "homepage": "https://github.com/klimichtg/n8n-whatsapp-alfacrm-funnel/tree/main/packages/n8n-nodes-alfacrm",
+  "author": {
+    "name": "klimichtg",
+    "email": "maksim.klim.one@gmail.com"
+  },
+  "main": "index.js",
+  "scripts": {
+    "build": "tsc && gulp build:icons",
+    "dev": "tsc --watch",
+    "lint": "eslint nodes credentials package.json",
+    "lintfix": "eslint nodes credentials package.json --fix",
+    "prepublishOnly": "npm run build && npm run lint -c .eslintrc.prepublish.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "n8n": {
+    "n8nNodesApiVersion": 1,
+    "credentials": [
+      "dist/credentials/AlfaCrmApi.credentials.js"
+    ],
+    "nodes": [
+      "dist/nodes/AlfaCRM/AlfaCRM.node.js"
+    ]
+  },
+  "devDependencies": {
+    "@typescript-eslint/parser": "^7.15.0",
+    "eslint": "^8.57.0",
+    "eslint-plugin-n8n-nodes-base": "^1.16.3",
+    "gulp": "^4.0.2",
+    "n8n-workflow": "*",
+    "prettier": "^3.3.2",
+    "typescript": "^5.5.3"
+  },
+  "peerDependencies": {
+    "n8n-workflow": "*"
+  }
+}

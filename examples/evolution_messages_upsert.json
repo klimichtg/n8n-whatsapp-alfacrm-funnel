@@ -1,0 +1,24 @@
+{
+  "_comment": "Real-world payload Evolution API sends to your n8n webhook on event=messages.upsert. Use this to test the workflow without setting up WhatsApp end-to-end. Send via curl: curl -X POST http://localhost:5678/webhook/evolution-incoming -H 'Content-Type: application/json' -d @evolution_messages_upsert.json",
+  "event": "messages.upsert",
+  "instance": "sales-bot-1",
+  "data": {
+    "key": {
+      "remoteJid": "79161234567@s.whatsapp.net",
+      "fromMe": false,
+      "id": "3EB0C9C8B6C8A4D5F1B2"
+    },
+    "pushName": "Иван Петров",
+    "messageTimestamp": 1730635200,
+    "message": {
+      "conversation": "Здравствуйте, видел вашу рекламу — хотел узнать про курсы английского для ребёнка 8 лет"
+    },
+    "messageType": "conversation",
+    "source": "web"
+  },
+  "destination": "http://n8n-main:5678/webhook/evolution-incoming",
+  "date_time": "2026-05-03T19:00:00.000Z",
+  "sender": "79991112233@s.whatsapp.net",
+  "server_url": "http://evolution-api:8080",
+  "apikey": "<masked>"
+}

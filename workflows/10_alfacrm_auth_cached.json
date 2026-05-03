@@ -1,0 +1,159 @@
+{
+  "name": "Sub: AlfaCRM Auth (Redis Cached + Retry)",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## 🔐 AlfaCRM auth с кэшем\n\nAlfaCRM выдаёт токен с TTL 3600 секунд и лимитит API на 5 req/sec для **любых** методов — включая `/v2api/auth/login`. Без кэша при бурсте сообщений auth-вызовы съедают весь лимит и блокируют CRUD.\n\n**Логика:**\n1. `GET wa:alfacrm:token` из Redis\n2. Если есть и не истёк — возвращаем\n3. Иначе `POST /v2api/auth/login` с retry (3 попытки, exponential backoff 1s → 2s → 4s)\n4. `SETEX wa:alfacrm:token 3500 <token>` (на 100 секунд меньше TTL — буфер на десинхронизацию)\n5. Возвращаем токен\n\nВызывается из main workflow через Execute Workflow вместо инлайн-auth.",
+        "height": 320,
+        "width": 460,
+        "color": 5
+      },
+      "id": "note",
+      "name": "Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-100, -120]
+    },
+    {
+      "parameters": {
+        "events": ["workflow_call"]
+      },
+      "id": "trig",
+      "name": "When Called by Main",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [-100, 280]
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "key": "wa:alfacrm:token",
+        "keyType": "string"
+      },
+      "id": "get",
+      "name": "Redis: Get Cached Token",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [120, 280]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "loose" },
+          "conditions": [
+            {
+              "id": "hit",
+              "leftValue": "={{ $json.value || $json.wa_alfacrm_token || '' }}",
+              "rightValue": "",
+              "operator": { "type": "string", "operation": "notEmpty", "singleValue": true }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "ifc",
+      "name": "Cache hit?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [340, 280]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://{{ $env.ALFACRM_HOSTNAME }}/v2api/auth/login",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Accept", "value": "application/json" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "bodyContentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"email\": \"{{ $env.ALFACRM_EMAIL }}\",\n  \"api_key\": \"{{ $env.ALFACRM_API_KEY }}\"\n}",
+        "options": {
+          "retry": { "maxTries": 3, "waitBetweenTries": 1000 },
+          "timeout": 10000
+        }
+      },
+      "id": "auth",
+      "name": "AlfaCRM: POST /auth/login",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [560, 400]
+    },
+    {
+      "parameters": {
+        "operation": "set",
+        "key": "wa:alfacrm:token",
+        "value": "={{ $json.token }}",
+        "keyType": "string",
+        "expire": true,
+        "ttl": 3500
+      },
+      "id": "cache",
+      "name": "Redis: Cache Token (3500s)",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [780, 400]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            { "id": "t1", "name": "token", "value": "={{ $json.token }}", "type": "string" },
+            { "id": "t2", "name": "fromCache", "value": "={{ false }}", "type": "boolean" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "out-fresh",
+      "name": "Out (fresh)",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [1000, 400]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "t1",
+              "name": "token",
+              "value": "={{ $json.value || $json.wa_alfacrm_token }}",
+              "type": "string"
+            },
+            { "id": "t2", "name": "fromCache", "value": "={{ true }}", "type": "boolean" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "out-cached",
+      "name": "Out (cached)",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [560, 200]
+    }
+  ],
+  "connections": {
+    "When Called by Main": { "main": [[{ "node": "Redis: Get Cached Token", "type": "main", "index": 0 }]] },
+    "Redis: Get Cached Token": { "main": [[{ "node": "Cache hit?", "type": "main", "index": 0 }]] },
+    "Cache hit?": {
+      "main": [
+        [{ "node": "Out (cached)", "type": "main", "index": 0 }],
+        [{ "node": "AlfaCRM: POST /auth/login", "type": "main", "index": 0 }]
+      ]
+    },
+    "AlfaCRM: POST /auth/login": { "main": [[{ "node": "Redis: Cache Token (3500s)", "type": "main", "index": 0 }]] },
+    "Redis: Cache Token (3500s)": { "main": [[{ "node": "Out (fresh)", "type": "main", "index": 0 }]] }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1" },
+  "id": "alfacrmauth0001x",
+  "versionId": "22222222-2222-2222-2222-222222222222",
+  "meta": {},
+  "pinData": {},
+  "tags": []
+}

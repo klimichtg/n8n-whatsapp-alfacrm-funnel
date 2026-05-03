@@ -1,0 +1,60 @@
+# Production reverse proxy with automatic HTTPS via Let's Encrypt.
+#
+# Usage:
+#   1. Set N8N_HOST=n8n.your-domain.com and EVOLUTION_HOST=evo.your-domain.com in .env
+#   2. Point DNS A-records to the VPS
+#   3. Add `caddy` service to docker-compose.yml (snippet below)
+#   4. docker compose up -d caddy
+#   5. Caddy auto-issues certs and starts proxying. Both n8n webhook URL and
+#      Evolution API are now HTTPS-served.
+#
+# docker-compose.yml addition:
+#   caddy:
+#     image: caddy:2-alpine
+#     restart: unless-stopped
+#     ports:
+#       - "80:80"
+#       - "443:443"
+#     volumes:
+#       - ./Caddyfile:/etc/caddy/Caddyfile:ro
+#       - caddy_data:/data
+#       - caddy_config:/config
+
+{$N8N_HOST} {
+    encode zstd gzip
+
+    # n8n webhook traffic accepts no Authorization on /webhook/* by design,
+    # but rate-limit to mitigate webhook bombing.
+    rate_limit {
+        zone webhook_zone {
+            key {remote_host}
+            events 60
+            window 1m
+        }
+    }
+
+    reverse_proxy n8n-main:5678 {
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+        flush_interval -1
+    }
+}
+
+{$EVOLUTION_HOST} {
+    encode zstd gzip
+
+    # Evolution API admin endpoints — protect with API key in front of Caddy.
+    @public path /webhook/*
+    handle @public {
+        reverse_proxy evolution-api:8080
+    }
+
+    handle {
+        # Force apikey header presence for non-webhook routes
+        @noKey not header apikey *
+        respond @noKey "401 Unauthorized" 401
+
+        reverse_proxy evolution-api:8080
+    }
+}

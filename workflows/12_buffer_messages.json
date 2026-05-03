@@ -1,0 +1,184 @@
+{
+  "name": "Sub: Message Buffer (Redis Debounce)",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## 🧠 Human-like message buffering\n\n**Проблема:** клиент пишет одну мысль 3-4 сообщениями подряд. Если бот отвечает на каждое — выглядит как робот, и AI получает фрагментированный контекст.\n\n**Решение (этот sub-workflow):**\n1. На каждое входящее сообщение — `LPUSH` в Redis-список `wa:buf:<phone>` и `SET wa:lock:<phone> = <messageId> EX 6` (перезаписываем lock)\n2. Ждём 6 секунд\n3. `GET wa:lock:<phone>` — если текущий `messageId` всё ещё там, значит за 6 секунд новых сообщений не пришло — **наш ход**. Иначе exit.\n4. `LRANGE wa:buf:<phone> 0 -1` — забираем весь буфер, склеиваем тексты через перенос строки\n5. `DEL wa:buf:<phone>` — чистим\n6. Возвращаем единый объединённый текст в main workflow\n\nЭто та самая «человекоподобность» которая делает разницу между «очередным AI-ботом» и «менеджером, который ведёт диалог».",
+        "height": 380,
+        "width": 460,
+        "color": 6
+      },
+      "id": "note-buf",
+      "name": "Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-100, -120]
+    },
+    {
+      "parameters": {
+        "events": ["workflow_call"],
+        "workflowInputs": {
+          "values": [
+            { "name": "phone", "type": "string" },
+            { "name": "messageText", "type": "string" },
+            { "name": "messageId", "type": "string" }
+          ]
+        }
+      },
+      "id": "node-trigger",
+      "name": "When Called by Main",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [-100, 320]
+    },
+    {
+      "parameters": {
+        "operation": "push",
+        "list": "=wa:buf:{{ $json.phone }}",
+        "tail": false,
+        "messageData": "={{ JSON.stringify({ id: $json.messageId, text: $json.messageText, ts: $now.toMillis() }) }}",
+        "options": {}
+      },
+      "id": "node-push",
+      "name": "Redis: Push to Buffer",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [120, 320]
+    },
+    {
+      "parameters": {
+        "operation": "set",
+        "key": "=wa:lock:{{ $('When Called by Main').item.json.phone }}",
+        "value": "={{ $('When Called by Main').item.json.messageId }}",
+        "keyType": "string",
+        "expire": true,
+        "ttl": 6
+      },
+      "id": "node-lock",
+      "name": "Redis: Set Lock 6s",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [340, 320]
+    },
+    {
+      "parameters": {
+        "amount": 6,
+        "unit": "seconds"
+      },
+      "id": "node-wait",
+      "name": "Wait 6s (debounce)",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [560, 320],
+      "webhookId": "buffer-wait-demo"
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "key": "=wa:lock:{{ $('When Called by Main').item.json.phone }}",
+        "keyType": "automatic"
+      },
+      "id": "node-get-lock",
+      "name": "Redis: Get Lock",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [780, 320]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "loose" },
+          "conditions": [
+            {
+              "id": "won",
+              "leftValue": "={{ $json.value }}",
+              "rightValue": "={{ $('When Called by Main').item.json.messageId }}",
+              "operator": { "type": "string", "operation": "equals" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "node-if-won",
+      "name": "We won the debounce?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1000, 320]
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "key": "=wa:buf:{{ $('When Called by Main').item.json.phone }}",
+        "keyType": "list",
+        "tail": false,
+        "options": {}
+      },
+      "id": "node-drain",
+      "name": "Redis: Drain Buffer",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [1220, 200]
+    },
+    {
+      "parameters": {
+        "operation": "delete",
+        "key": "=wa:buf:{{ $('When Called by Main').item.json.phone }}"
+      },
+      "id": "node-clear",
+      "name": "Redis: Clear Buffer",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [1440, 200]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Объединяем все сообщения в буфере в один связный запрос для AI.\n// Сортируем по timestamp (на случай гонок) и склеиваем через перенос строки.\nconst raw = items[0].json.value || items[0].json[Object.keys(items[0].json)[0]] || [];\nconst arr = Array.isArray(raw) ? raw : [raw];\nconst parsed = arr\n  .map(s => { try { return JSON.parse(s); } catch { return null; } })\n  .filter(Boolean)\n  .sort((a, b) => a.ts - b.ts);\n\nconst combined = parsed.map(p => p.text).join('\\n');\n\nreturn [{\n  json: {\n    won: true,\n    combinedMessage: combined,\n    messageCount: parsed.length,\n    phone: $('When Called by Main').item.json.phone\n  }\n}];"
+      },
+      "id": "node-combine",
+      "name": "Combine Messages",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1660, 200]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            { "id": "x1", "name": "won", "value": "={{ false }}", "type": "boolean" },
+            { "id": "x2", "name": "combinedMessage", "value": "", "type": "string" },
+            { "id": "x3", "name": "phone", "value": "={{ $('When Called by Main').item.json.phone }}", "type": "string" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node-skip",
+      "name": "Skip (newer msg won)",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [1220, 460]
+    }
+  ],
+  "connections": {
+    "When Called by Main": { "main": [[{ "node": "Redis: Push to Buffer", "type": "main", "index": 0 }]] },
+    "Redis: Push to Buffer": { "main": [[{ "node": "Redis: Set Lock 6s", "type": "main", "index": 0 }]] },
+    "Redis: Set Lock 6s": { "main": [[{ "node": "Wait 6s (debounce)", "type": "main", "index": 0 }]] },
+    "Wait 6s (debounce)": { "main": [[{ "node": "Redis: Get Lock", "type": "main", "index": 0 }]] },
+    "Redis: Get Lock": { "main": [[{ "node": "We won the debounce?", "type": "main", "index": 0 }]] },
+    "We won the debounce?": {
+      "main": [
+        [{ "node": "Redis: Drain Buffer", "type": "main", "index": 0 }],
+        [{ "node": "Skip (newer msg won)", "type": "main", "index": 0 }]
+      ]
+    },
+    "Redis: Drain Buffer": { "main": [[{ "node": "Redis: Clear Buffer", "type": "main", "index": 0 }]] },
+    "Redis: Clear Buffer": { "main": [[{ "node": "Combine Messages", "type": "main", "index": 0 }]] }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1" },
+  "id": "buffermessages0001",
+  "versionId": "11111111-1111-1111-1111-111111111111",
+  "meta": {},
+  "pinData": {},
+  "tags": []
+}

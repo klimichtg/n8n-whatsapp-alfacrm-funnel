@@ -1,0 +1,783 @@
+{
+  "name": "WhatsApp → AlfaCRM Sales Funnel (Main, v2 Advanced)",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## 📥 1. Webhook + signature\n\nEvolution API шлёт `messages.upsert` сюда. Узел `Verify Signature` проверяет header `apikey` (или HMAC-сигнатуру для прод-конфигов) и режет посторонние запросы 401-ым.\n\n**Path:** `/webhook/evolution-incoming`\n\nПротив webhook-bombing: на уровне Caddyfile добавлен rate_limit 60/min/IP.",
+        "height": 280,
+        "width": 360,
+        "color": 4
+      },
+      "id": "note-webhook",
+      "name": "Note: Webhook",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-220, -120]
+    },
+    {
+      "parameters": {
+        "content": "## 🎬 2. Multimodal routing\n\nКлиент может прислать **текст / голосовое / фото**. Мы определяем тип, и:\n- text → используем `conversation` или `extendedTextMessage.text`\n- audio → скачиваем base64 → OpenAI Whisper STT → используем транскрипт\n- image → скачиваем base64 → GPT-4o vision → используем сгенерированный caption + распознанный текст с изображения\n\nЭто превращает бота в multimodal-агента, а не в текстовый чат.",
+        "height": 320,
+        "width": 460,
+        "color": 5
+      },
+      "id": "note-multimodal",
+      "name": "Note: Multimodal",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [600, -120]
+    },
+    {
+      "parameters": {
+        "content": "## 💾 3. Human-like буферизация\n\nЕсли клиент пишет 3 сообщения подряд за 4 секунды — мы НЕ генерируем 3 ответа. Sub-workflow `12_buffer_messages` дебаунсит 6 секунд и склеивает все сообщения в один контекст для AI.\n\nПобедитель гонки (lock в Redis) забирает буфер и идёт дальше. Остальные exit.",
+        "height": 280,
+        "width": 460,
+        "color": 6
+      },
+      "id": "note-buffer",
+      "name": "Note: Buffer",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [1700, -120]
+    },
+    {
+      "parameters": {
+        "content": "## 🔐 4. AlfaCRM (auth кэш + find/create)\n\nAuth идёт через sub-workflow `10_alfacrm_auth_cached` — Redis-кэш на 3500s. Один токен на десятки тысяч сообщений.\n\n`/customer/index` ищет по `phone`. Если есть — берём id; нет — `customer/create` с дефолтным lead_status_id (этап 1, первичный) и lead_source_id из env.",
+        "height": 280,
+        "width": 460,
+        "color": 5
+      },
+      "id": "note-alfacrm",
+      "name": "Note: AlfaCRM",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [2820, -120]
+    },
+    {
+      "parameters": {
+        "content": "## 🤖 5. AI-агент квалификации\n\nLangChain Tools Agent + OpenAI Chat Model + Postgres Chat Memory.\n\n**Memory:** Postgres-backed history по `sessionId = wa:<phone>` — агент помнит весь предыдущий диалог.\n\n**System prompt:** жёстко фиксирует роль (sales SDR) + 4-параметрическую квалификацию (потребность / бюджет / сроки / ЛПР) + JSON-схему ответа.\n\n**Output validator:** Structured Output Parser режет невалидный JSON — на проде ставим Auto-fixing Output Parser сверху для самовосстановления.\n\nLLM swap: меняем `OpenAI Chat Model` на `Google Gemini Chat Model` или `Anthropic Chat Model` без касания остальной логики.",
+        "height": 380,
+        "width": 460,
+        "color": 3
+      },
+      "id": "note-ai",
+      "name": "Note: AI",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [3940, -120]
+    },
+    {
+      "parameters": {
+        "content": "## 🎯 6. Маршрутизация действий\n\nAI возвращает `action`:\n- `continue` — просто отвечаем клиенту\n- `move_stage` — двигаем сделку в AlfaCRM на `newStageId` + отвечаем\n- `handoff` — горячий лид: запускаем sub-workflow `21_hot_lead_handoff` (Telegram-карточка менеджеру) + двигаем стадию + отвечаем\n\nFallback (некорректный JSON от LLM) → `continue` с ответом «уточните, пожалуйста».",
+        "height": 300,
+        "width": 460,
+        "color": 2
+      },
+      "id": "note-route",
+      "name": "Note: Routing",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [5060, -120]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "evolution-incoming",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "wh",
+      "name": "Evolution Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [-220, 320],
+      "webhookId": "evolution-incoming-demo"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Verify webhook authenticity.\n// Evolution API allows static apikey header OR HMAC-SHA256 over the body (when WEBHOOK_HMAC_KEY is set).\n// We accept either; reject if neither matches.\nconst headers = $input.first().json.headers || {};\nconst body = $input.first().json.body;\nconst expected = $env.EVOLUTION_API_KEY;\nconst hmacKey = $env.EVOLUTION_HMAC_KEY;\n\nconst providedKey = headers['apikey'] || headers['x-apikey'];\nlet okApiKey = expected && providedKey && providedKey === expected;\n\nlet okHmac = false;\nif (hmacKey && headers['x-hub-signature-256']) {\n  const crypto = require('crypto');\n  const sig = 'sha256=' + crypto.createHmac('sha256', hmacKey).update(JSON.stringify(body)).digest('hex');\n  okHmac = crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(headers['x-hub-signature-256']));\n}\n\nreturn [{ json: { ...body, _verified: okApiKey || okHmac, _ip: headers['x-real-ip'] || headers['x-forwarded-for'] || 'unknown' } }];"
+      },
+      "id": "verify",
+      "name": "Verify Signature",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [0, 320]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "id": "v",
+              "leftValue": "={{ $json._verified }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "equals", "singleValue": true }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-verify",
+      "name": "Verified?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [220, 320]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={ \"error\": \"Unauthorized webhook\" }",
+        "options": { "responseCode": 401 }
+      },
+      "id": "resp-401",
+      "name": "Respond 401",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [440, 480]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.event }}",
+              "rightValue": "messages.upsert",
+              "operator": { "type": "string", "operation": "equals" }
+            },
+            {
+              "id": "c2",
+              "leftValue": "={{ $json.data?.key?.fromMe || false }}",
+              "rightValue": false,
+              "operator": { "type": "boolean", "operation": "equals", "singleValue": true }
+            },
+            {
+              "id": "c3",
+              "leftValue": "={{ ($json.data?.key?.remoteJid || '').endsWith('@g.us') }}",
+              "rightValue": false,
+              "operator": { "type": "boolean", "operation": "equals", "singleValue": true }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "filter",
+      "name": "Personal Incoming Msg?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [440, 280]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={ \"ok\": true, \"skipped\": \"not personal\" }",
+        "options": {}
+      },
+      "id": "resp-skip",
+      "name": "Respond Skip",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [660, 460]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Determine message type & extract media reference if needed.\nconst d = $json.data || {};\nconst msg = d.message || {};\nconst type = d.messageType || (msg.conversation ? 'conversation' : msg.imageMessage ? 'imageMessage' : msg.audioMessage ? 'audioMessage' : 'other');\n\nlet category = 'text';\nif (type === 'audioMessage' || msg.audioMessage) category = 'audio';\nelse if (type === 'imageMessage' || msg.imageMessage) category = 'image';\nelse if (msg.conversation || msg.extendedTextMessage) category = 'text';\nelse category = 'other';\n\nconst text = msg.conversation || msg.extendedTextMessage?.text || msg.imageMessage?.caption || '';\nconst phone = (d.key?.remoteJid || '').split('@')[0];\n\nreturn [{\n  json: {\n    category,\n    rawType: type,\n    text,\n    phone,\n    phoneE164: '+' + phone.replace(/[^\\d]/g, ''),\n    pushName: d.pushName || phone,\n    instance: $('Verify Signature').item.json.instance,\n    messageId: d.key?.id,\n    mediaKey: msg.audioMessage?.mediaKey || msg.imageMessage?.mediaKey || null,\n    mediaUrl: msg.audioMessage?.url || msg.imageMessage?.url || null,\n    raw: $json\n  }\n}];"
+      },
+      "id": "router",
+      "name": "Detect Message Type",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [660, 280]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            { "conditions": { "options": { "leftValue": "", "caseSensitive": true, "typeValidation": "strict" }, "conditions": [{ "id": "t", "leftValue": "={{ $json.category }}", "rightValue": "text", "operator": { "type": "string", "operation": "equals" } }], "combinator": "and" }, "renameOutput": true, "outputKey": "text" },
+            { "conditions": { "options": { "leftValue": "", "caseSensitive": true, "typeValidation": "strict" }, "conditions": [{ "id": "a", "leftValue": "={{ $json.category }}", "rightValue": "audio", "operator": { "type": "string", "operation": "equals" } }], "combinator": "and" }, "renameOutput": true, "outputKey": "audio" },
+            { "conditions": { "options": { "leftValue": "", "caseSensitive": true, "typeValidation": "strict" }, "conditions": [{ "id": "i", "leftValue": "={{ $json.category }}", "rightValue": "image", "operator": { "type": "string", "operation": "equals" } }], "combinator": "and" }, "renameOutput": true, "outputKey": "image" }
+          ]
+        },
+        "options": { "fallbackOutput": "extra", "renameFallbackOutput": "other" }
+      },
+      "id": "switch-type",
+      "name": "By Message Type",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [880, 280]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=http://evolution-api:8080/chat/getBase64FromMediaMessage/{{ $json.instance }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.EVOLUTION_API_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "bodyContentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={ \"message\": {{ JSON.stringify($json.raw.data.message) }}, \"convertToMp4\": false }",
+        "options": { "timeout": 30000 }
+      },
+      "id": "audio-fetch",
+      "name": "Evolution: Get Audio",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1100, 200]
+    },
+    {
+      "parameters": {
+        "resource": "audio",
+        "operation": "transcribe",
+        "binaryPropertyName": "data",
+        "options": { "language": "ru" }
+      },
+      "id": "whisper",
+      "name": "Whisper STT",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 1.6,
+      "position": [1320, 200]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            { "id": "x1", "name": "text", "value": "={{ $json.text }}", "type": "string" },
+            { "id": "x2", "name": "phone", "value": "={{ $('Detect Message Type').item.json.phone }}", "type": "string" },
+            { "id": "x3", "name": "phoneE164", "value": "={{ $('Detect Message Type').item.json.phoneE164 }}", "type": "string" },
+            { "id": "x4", "name": "pushName", "value": "={{ $('Detect Message Type').item.json.pushName }}", "type": "string" },
+            { "id": "x5", "name": "instance", "value": "={{ $('Detect Message Type').item.json.instance }}", "type": "string" },
+            { "id": "x6", "name": "messageId", "value": "={{ $('Detect Message Type').item.json.messageId }}", "type": "string" },
+            { "id": "x7", "name": "originalType", "value": "audio", "type": "string" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "audio-out",
+      "name": "Audio → Text",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [1540, 200]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=http://evolution-api:8080/chat/getBase64FromMediaMessage/{{ $json.instance }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.EVOLUTION_API_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "bodyContentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={ \"message\": {{ JSON.stringify($json.raw.data.message) }}, \"convertToMp4\": false }",
+        "options": { "timeout": 30000 }
+      },
+      "id": "image-fetch",
+      "name": "Evolution: Get Image",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1100, 380]
+    },
+    {
+      "parameters": {
+        "resource": "image",
+        "operation": "analyze",
+        "modelId": { "__rl": true, "value": "gpt-4o-mini", "mode": "list" },
+        "text": "Опиши, что на этом изображении. Если есть текст — приведи его дословно. Если это документ или скриншот — извлеки ключевые данные (числа, даты, контакты). Ответь по-русски, кратко (1-3 предложения).",
+        "inputType": "base64",
+        "binaryPropertyName": "data",
+        "options": {}
+      },
+      "id": "vision",
+      "name": "GPT-4o Vision",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 1.6,
+      "position": [1320, 380]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            { "id": "i1", "name": "text", "value": "=[Прислал изображение] {{ $json.content || $json.message?.content || $json.choices?.[0]?.message?.content }}", "type": "string" },
+            { "id": "i2", "name": "phone", "value": "={{ $('Detect Message Type').item.json.phone }}", "type": "string" },
+            { "id": "i3", "name": "phoneE164", "value": "={{ $('Detect Message Type').item.json.phoneE164 }}", "type": "string" },
+            { "id": "i4", "name": "pushName", "value": "={{ $('Detect Message Type').item.json.pushName }}", "type": "string" },
+            { "id": "i5", "name": "instance", "value": "={{ $('Detect Message Type').item.json.instance }}", "type": "string" },
+            { "id": "i6", "name": "messageId", "value": "={{ $('Detect Message Type').item.json.messageId }}", "type": "string" },
+            { "id": "i7", "name": "originalType", "value": "image", "type": "string" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "image-out",
+      "name": "Image → Caption",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [1540, 380]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            { "id": "t1", "name": "text", "value": "={{ $json.text }}", "type": "string" },
+            { "id": "t2", "name": "phone", "value": "={{ $json.phone }}", "type": "string" },
+            { "id": "t3", "name": "phoneE164", "value": "={{ $json.phoneE164 }}", "type": "string" },
+            { "id": "t4", "name": "pushName", "value": "={{ $json.pushName }}", "type": "string" },
+            { "id": "t5", "name": "instance", "value": "={{ $json.instance }}", "type": "string" },
+            { "id": "t6", "name": "messageId", "value": "={{ $json.messageId }}", "type": "string" },
+            { "id": "t7", "name": "originalType", "value": "text", "type": "string" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "text-out",
+      "name": "Text passthrough",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [1100, 80]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            { "id": "o1", "name": "text", "value": "[не поддерживаемый формат сообщения]", "type": "string" },
+            { "id": "o2", "name": "phone", "value": "={{ $('Detect Message Type').item.json.phone }}", "type": "string" },
+            { "id": "o3", "name": "phoneE164", "value": "={{ $('Detect Message Type').item.json.phoneE164 }}", "type": "string" },
+            { "id": "o4", "name": "pushName", "value": "={{ $('Detect Message Type').item.json.pushName }}", "type": "string" },
+            { "id": "o5", "name": "instance", "value": "={{ $('Detect Message Type').item.json.instance }}", "type": "string" },
+            { "id": "o6", "name": "messageId", "value": "={{ $('Detect Message Type').item.json.messageId }}", "type": "string" },
+            { "id": "o7", "name": "originalType", "value": "other", "type": "string" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "other-out",
+      "name": "Other passthrough",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [1100, 540]
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineByPosition",
+        "options": {}
+      },
+      "id": "merge-types",
+      "name": "Merge: Normalized",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [1760, 280]
+    },
+    {
+      "parameters": {
+        "workflowId": { "__rl": true, "value": "buffermessages0001", "mode": "id" },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "phone": "={{ $json.phone }}",
+            "messageText": "={{ $json.text }}",
+            "messageId": "={{ $json.messageId }}"
+          },
+          "schema": [
+            { "id": "phone", "displayName": "phone", "required": true, "type": "string" },
+            { "id": "messageText", "displayName": "messageText", "required": true, "type": "string" },
+            { "id": "messageId", "displayName": "messageId", "required": true, "type": "string" }
+          ]
+        }
+      },
+      "id": "buf",
+      "name": "Buffer: Debounce 6s",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [1980, 280]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "id": "won",
+              "leftValue": "={{ $json.won }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "equals", "singleValue": true }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-won",
+      "name": "Won debounce?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [2200, 280]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={ \"ok\": true, \"skipped\": \"newer message took over\" }",
+        "options": {}
+      },
+      "id": "resp-debounced",
+      "name": "Respond Skip Debounce",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [2420, 460]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Combine debounced messages with normalized contact info.\nconst buf = $('Buffer: Debounce 6s').item.json;\nconst contact = $('Merge: Normalized').item.json;\nreturn [{\n  json: {\n    ...contact,\n    text: buf.combinedMessage || contact.text,\n    bufferedCount: buf.messageCount || 1\n  }\n}];"
+      },
+      "id": "post-buf",
+      "name": "Apply Buffered Text",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2420, 280]
+    },
+    {
+      "parameters": {
+        "workflowId": { "__rl": true, "value": "alfacrmauth0001x", "mode": "id" }
+      },
+      "id": "auth",
+      "name": "AlfaCRM: Auth (cached)",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [2640, 280]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Carry both auth output AND original normalized fields forward.\nconst auth = $json;\nconst ctx = $('Apply Buffered Text').item.json;\nreturn [{ json: { ...ctx, alfacrmToken: auth.token } }];"
+      },
+      "id": "post-auth",
+      "name": "Carry Token + Ctx",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2860, 280]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://{{ $env.ALFACRM_HOSTNAME }}/v2api/{{ $env.ALFACRM_BRANCH_ID }}/customer/index",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "X-ALFACRM-TOKEN", "value": "={{ $json.alfacrmToken }}" },
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Accept", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "bodyContentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"phone\": \"{{ $json.phoneE164 }}\",\n  \"page\": 0\n}",
+        "options": { "retry": { "maxTries": 3, "waitBetweenTries": 500 } }
+      },
+      "id": "find",
+      "name": "AlfaCRM: Find Customer",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [3080, 280]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "loose" },
+          "conditions": [
+            {
+              "id": "exists",
+              "leftValue": "={{ $json.total || 0 }}",
+              "rightValue": 0,
+              "operator": { "type": "number", "operation": "gt" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-cust",
+      "name": "Customer Exists?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [3300, 280]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://{{ $env.ALFACRM_HOSTNAME }}/v2api/{{ $env.ALFACRM_BRANCH_ID }}/customer/create",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "X-ALFACRM-TOKEN", "value": "={{ $('Carry Token + Ctx').item.json.alfacrmToken }}" },
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Accept", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "bodyContentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"name\": \"{{ $('Carry Token + Ctx').item.json.pushName }}\",\n  \"phone\": [\"{{ $('Carry Token + Ctx').item.json.phoneE164 }}\"],\n  \"legal_type\": 1,\n  \"is_study\": 0,\n  \"lead_status_id\": {{ $env.ALFACRM_DEFAULT_LEAD_STATUS_ID || 1 }},\n  \"lead_source_id\": {{ $env.ALFACRM_WHATSAPP_LEAD_SOURCE_ID || 1 }},\n  \"branch_ids\": [{{ $env.ALFACRM_BRANCH_ID }}],\n  \"note\": \"WhatsApp лид. Первое сообщение: {{ $('Carry Token + Ctx').item.json.text }}\"\n}",
+        "options": { "retry": { "maxTries": 3, "waitBetweenTries": 500 } }
+      },
+      "id": "create",
+      "name": "AlfaCRM: Create Customer",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [3520, 460]
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineAll",
+        "options": {}
+      },
+      "id": "merge-cust",
+      "name": "Merge: Customer Ctx",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [3740, 360]
+    },
+    {
+      "parameters": {
+        "jsCode": "const ctx = $('Carry Token + Ctx').item.json;\nlet customerId, currentStage;\n\nconst found = $('AlfaCRM: Find Customer').item.json;\nif ((found.total || 0) > 0) {\n  customerId = found.items[0].id;\n  currentStage = found.items[0].lead_status_id;\n} else {\n  const created = $('AlfaCRM: Create Customer').item.json;\n  customerId = created.model?.id || created.id;\n  currentStage = created.model?.lead_status_id || 1;\n}\n\nreturn [{\n  json: {\n    ...ctx,\n    customerId,\n    currentStageId: currentStage,\n    sessionId: `wa:${ctx.phoneE164}`\n  }\n}];"
+      },
+      "id": "build-ctx",
+      "name": "Build Lead Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3960, 360]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Сообщение клиента ({{ $json.pushName }}, {{ $json.phoneE164 }}):\n\"\"\"\n{{ $json.text }}\n\"\"\"\n\nТекущий этап в CRM: {{ $json.currentStageId }}.\nТип сообщения: {{ $json.originalType }}.\nКоличество склеенных входящих: {{ $json.bufferedCount }}.",
+        "hasOutputParser": false,
+        "options": {
+          "systemMessage": "Ты — AI-ассистент отдела продаж. Твоя задача:\n1. Отвечать на WhatsApp-сообщения клиента вежливо и кратко (2-4 предложения).\n2. Квалифицировать лид по 4 параметрам (BANT-light): потребность, бюджет, сроки, ЛПР.\n3. По мере выяснения параметров переводить сделку по этапам воронки.\n\nЭтапы воронки (lead_status_id):\n- 1: Новый лид (только обратился)\n- 2: В работе (выяснили потребность)\n- 3: Квалифицирован (есть бюджет/сроки/потребность подтверждены)\n- 4: Горячий (готов оплачивать / просит счёт / спрашивает реквизиты)\n- 5: Не целевой (не наша ЦА, отказ, мусор)\n\nВсегда возвращай СТРОГО JSON без markdown, без \\\"```json\\\", без преамбулы:\n{\n  \"reply\": \"<текст ответа клиенту на русском>\",\n  \"action\": \"continue\" | \"move_stage\" | \"handoff\",\n  \"newStageId\": <number или null если continue>,\n  \"reason\": \"<краткое объяснение твоего решения>\"\n}\n\nПравила:\n- continue — обычный ответ без смены этапа\n- move_stage — переводим на новый этап (укажи newStageId)\n- handoff — горячий лид на 4-м этапе, нужен живой менеджер (newStageId: 4)\n- Если клиент пишет мусор/спам/не по теме — move_stage на 5\n- Не выдумывай факты о компании которых не знаешь — спроси менеджера"
+        }
+      },
+      "id": "ai",
+      "name": "AI: Lead Qualifier",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 1.7,
+      "position": [4180, 360]
+    },
+    {
+      "parameters": {
+        "model": { "__rl": true, "value": "gpt-4o-mini", "mode": "list" },
+        "options": { "temperature": 0.3, "maxTokens": 400 }
+      },
+      "id": "llm",
+      "name": "OpenAI Chat Model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.2,
+      "position": [4080, 560]
+    },
+    {
+      "parameters": {
+        "sessionIdType": "customKey",
+        "sessionKey": "={{ $('Build Lead Context').item.json.sessionId }}",
+        "tableName": "n8n_chat_histories",
+        "contextWindowLength": 20
+      },
+      "id": "memory",
+      "name": "Postgres Chat Memory",
+      "type": "@n8n/n8n-nodes-langchain.memoryPostgresChat",
+      "typeVersion": 1.3,
+      "position": [4280, 560]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Robust AI output parsing with auto-recovery.\nconst raw = $json.output || $json.text || JSON.stringify($json);\n\nlet parsed;\n// Strip markdown fences if model wrapped JSON\nconst clean = raw.replace(/```json\\s*|\\s*```/g, '').trim();\ntry {\n  parsed = JSON.parse(clean);\n} catch {\n  // Try to extract first JSON object\n  const m = clean.match(/\\{[\\s\\S]*\\}/);\n  if (m) {\n    try { parsed = JSON.parse(m[0]); } catch { parsed = null; }\n  }\n}\n\nif (!parsed || !parsed.reply) {\n  parsed = {\n    reply: 'Извините, могу уточнить ваш запрос?',\n    action: 'continue',\n    newStageId: null,\n    reason: 'AI returned non-JSON or empty output'\n  };\n}\n\n// Always carry context forward\nconst ctx = $('Build Lead Context').item.json;\nreturn [{\n  json: {\n    ...ctx,\n    aiReply: parsed.reply,\n    aiAction: parsed.action || 'continue',\n    aiNewStageId: parsed.newStageId,\n    aiReason: parsed.reason\n  }\n}];"
+      },
+      "id": "parse",
+      "name": "Parse AI Output",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [4720, 360]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            { "conditions": { "options": { "leftValue": "", "caseSensitive": true, "typeValidation": "strict" }, "conditions": [{ "id": "h", "leftValue": "={{ $json.aiAction }}", "rightValue": "handoff", "operator": { "type": "string", "operation": "equals" } }], "combinator": "and" }, "renameOutput": true, "outputKey": "handoff" },
+            { "conditions": { "options": { "leftValue": "", "caseSensitive": true, "typeValidation": "strict" }, "conditions": [{ "id": "ms", "leftValue": "={{ $json.aiAction }}", "rightValue": "move_stage", "operator": { "type": "string", "operation": "equals" } }], "combinator": "and" }, "renameOutput": true, "outputKey": "move_stage" }
+          ]
+        },
+        "options": { "fallbackOutput": "extra", "renameFallbackOutput": "continue" }
+      },
+      "id": "switch",
+      "name": "Route by Action",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [4940, 360]
+    },
+    {
+      "parameters": {
+        "workflowId": { "__rl": true, "value": "hotleadhandoff1", "mode": "id" },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "customerId": "={{ $json.customerId }}",
+            "phone": "={{ $json.phoneE164 }}",
+            "sessionId": "={{ $json.sessionId }}",
+            "reason": "={{ $json.aiReason }}",
+            "alfacrmToken": "={{ $json.alfacrmToken }}"
+          }
+        }
+      },
+      "id": "handoff",
+      "name": "Hot Lead → Telegram",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [5160, 200]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://{{ $env.ALFACRM_HOSTNAME }}/v2api/{{ $env.ALFACRM_BRANCH_ID }}/customer/update?id={{ $json.customerId }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "X-ALFACRM-TOKEN", "value": "={{ $json.alfacrmToken }}" },
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Accept", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "bodyContentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"lead_status_id\": {{ $json.aiNewStageId }},\n  \"note\": \"AI move: {{ $json.aiReason }}\"\n}",
+        "options": { "retry": { "maxTries": 3, "waitBetweenTries": 500 } }
+      },
+      "id": "update",
+      "name": "AlfaCRM: Update Stage",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [5380, 360]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=http://evolution-api:8080/message/sendText/{{ $json.instance }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.EVOLUTION_API_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "bodyContentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"number\": \"{{ $json.phoneE164 }}\",\n  \"text\": {{ JSON.stringify($json.aiReply) }},\n  \"delay\": 1000\n}",
+        "options": { "retry": { "maxTries": 3, "waitBetweenTries": 1500 } }
+      },
+      "id": "reply",
+      "name": "Evolution: Send Reply",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [5600, 360]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={ \"ok\": true, \"action\": \"{{ $json.aiAction }}\", \"customerId\": {{ $json.customerId }} }",
+        "options": {}
+      },
+      "id": "ok",
+      "name": "Respond 200 OK",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [5820, 360]
+    }
+  ],
+  "connections": {
+    "Evolution Webhook": { "main": [[{ "node": "Verify Signature", "type": "main", "index": 0 }]] },
+    "Verify Signature": { "main": [[{ "node": "Verified?", "type": "main", "index": 0 }]] },
+    "Verified?": {
+      "main": [
+        [{ "node": "Personal Incoming Msg?", "type": "main", "index": 0 }],
+        [{ "node": "Respond 401", "type": "main", "index": 0 }]
+      ]
+    },
+    "Personal Incoming Msg?": {
+      "main": [
+        [{ "node": "Detect Message Type", "type": "main", "index": 0 }],
+        [{ "node": "Respond Skip", "type": "main", "index": 0 }]
+      ]
+    },
+    "Detect Message Type": { "main": [[{ "node": "By Message Type", "type": "main", "index": 0 }]] },
+    "By Message Type": {
+      "main": [
+        [{ "node": "Text passthrough", "type": "main", "index": 0 }],
+        [{ "node": "Evolution: Get Audio", "type": "main", "index": 0 }],
+        [{ "node": "Evolution: Get Image", "type": "main", "index": 0 }],
+        [{ "node": "Other passthrough", "type": "main", "index": 0 }]
+      ]
+    },
+    "Evolution: Get Audio": { "main": [[{ "node": "Whisper STT", "type": "main", "index": 0 }]] },
+    "Whisper STT": { "main": [[{ "node": "Audio → Text", "type": "main", "index": 0 }]] },
+    "Evolution: Get Image": { "main": [[{ "node": "GPT-4o Vision", "type": "main", "index": 0 }]] },
+    "GPT-4o Vision": { "main": [[{ "node": "Image → Caption", "type": "main", "index": 0 }]] },
+    "Text passthrough": { "main": [[{ "node": "Merge: Normalized", "type": "main", "index": 0 }]] },
+    "Audio → Text": { "main": [[{ "node": "Merge: Normalized", "type": "main", "index": 1 }]] },
+    "Image → Caption": { "main": [[{ "node": "Merge: Normalized", "type": "main", "index": 2 }]] },
+    "Other passthrough": { "main": [[{ "node": "Merge: Normalized", "type": "main", "index": 3 }]] },
+    "Merge: Normalized": { "main": [[{ "node": "Buffer: Debounce 6s", "type": "main", "index": 0 }]] },
+    "Buffer: Debounce 6s": { "main": [[{ "node": "Won debounce?", "type": "main", "index": 0 }]] },
+    "Won debounce?": {
+      "main": [
+        [{ "node": "Apply Buffered Text", "type": "main", "index": 0 }],
+        [{ "node": "Respond Skip Debounce", "type": "main", "index": 0 }]
+      ]
+    },
+    "Apply Buffered Text": { "main": [[{ "node": "AlfaCRM: Auth (cached)", "type": "main", "index": 0 }]] },
+    "AlfaCRM: Auth (cached)": { "main": [[{ "node": "Carry Token + Ctx", "type": "main", "index": 0 }]] },
+    "Carry Token + Ctx": { "main": [[{ "node": "AlfaCRM: Find Customer", "type": "main", "index": 0 }]] },
+    "AlfaCRM: Find Customer": { "main": [[{ "node": "Customer Exists?", "type": "main", "index": 0 }]] },
+    "Customer Exists?": {
+      "main": [
+        [{ "node": "Merge: Customer Ctx", "type": "main", "index": 0 }],
+        [{ "node": "AlfaCRM: Create Customer", "type": "main", "index": 0 }]
+      ]
+    },
+    "AlfaCRM: Create Customer": { "main": [[{ "node": "Merge: Customer Ctx", "type": "main", "index": 1 }]] },
+    "Merge: Customer Ctx": { "main": [[{ "node": "Build Lead Context", "type": "main", "index": 0 }]] },
+    "Build Lead Context": { "main": [[{ "node": "AI: Lead Qualifier", "type": "main", "index": 0 }]] },
+    "OpenAI Chat Model": { "ai_languageModel": [[{ "node": "AI: Lead Qualifier", "type": "ai_languageModel", "index": 0 }]] },
+    "Postgres Chat Memory": { "ai_memory": [[{ "node": "AI: Lead Qualifier", "type": "ai_memory", "index": 0 }]] },
+    "AI: Lead Qualifier": { "main": [[{ "node": "Parse AI Output", "type": "main", "index": 0 }]] },
+    "Parse AI Output": { "main": [[{ "node": "Route by Action", "type": "main", "index": 0 }]] },
+    "Route by Action": {
+      "main": [
+        [{ "node": "Hot Lead → Telegram", "type": "main", "index": 0 }, { "node": "AlfaCRM: Update Stage", "type": "main", "index": 0 }],
+        [{ "node": "AlfaCRM: Update Stage", "type": "main", "index": 0 }],
+        [{ "node": "Evolution: Send Reply", "type": "main", "index": 0 }]
+      ]
+    },
+    "Hot Lead → Telegram": { "main": [[]] },
+    "AlfaCRM: Update Stage": { "main": [[{ "node": "Evolution: Send Reply", "type": "main", "index": 0 }]] },
+    "Evolution: Send Reply": { "main": [[{ "node": "Respond 200 OK", "type": "main", "index": 0 }]] }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1" },
+  "id": "ecab503c5ec7a4e6",
+  "versionId": "66666666-6666-6666-6666-666666666666",
+  "meta": {},
+  "pinData": {},
+  "tags": []
+}

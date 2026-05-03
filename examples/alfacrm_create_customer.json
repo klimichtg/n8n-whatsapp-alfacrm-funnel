@@ -1,0 +1,39 @@
+{
+  "_endpoint": "POST https://{hostname}/v2api/{branch}/customer/create",
+  "_headers": {
+    "X-ALFACRM-TOKEN": "<auth-token>",
+    "Content-Type": "application/json"
+  },
+  "_body": {
+    "name": "Иван Петров",
+    "phone": ["+79161234567"],
+    "legal_type": 1,
+    "is_study": 0,
+    "lead_status_id": 1,
+    "lead_source_id": 4,
+    "branch_ids": [1],
+    "note": "Создан автоматически из WhatsApp (+79161234567)"
+  },
+  "_response_success": {
+    "success": true,
+    "errors": [],
+    "model": {
+      "id": 12345,
+      "name": "Иван Петров",
+      "phone": ["+79161234567"],
+      "lead_status_id": 1,
+      "lead_source_id": 4,
+      "is_study": 0,
+      "branch_ids": [1],
+      "created_at": "2026-05-03 19:00:00",
+      "updated_at": "2026-05-03 19:00:00"
+    }
+  },
+  "_notes": [
+    "legal_type: 1 = физ.лицо, 2 = юр.лицо",
+    "is_study: 0 = лид, 1 = ученик/клиент",
+    "lead_status_id маппится на этапы вашей воронки в AlfaCRM (Настройки → Продажи → Этапы воронки)",
+    "lead_source_id: ID источника (Настройки → Продажи → Источники лидов)",
+    "AlfaCRM лимитит API на 5 req/sec — массовые операции батчуйте"
+  ]
+}

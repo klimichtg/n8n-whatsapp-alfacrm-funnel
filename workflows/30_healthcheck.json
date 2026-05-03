@@ -1,0 +1,166 @@
+{
+  "name": "Health Check (n8n + Evolution + AlfaCRM)",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## ❤️ Health check\n\nКаждые 5 минут пингуем все три критичных сервиса:\n- n8n `/healthz`\n- Evolution API `/instance/connectionState/<instance>`\n- AlfaCRM `/v2api/auth/login` (если 401 — токен невалиден; если 5xx — CRM лежит)\n\nПри деградации любого — алерт в Telegram-канал DevOps + Postgres лог инцидента.\nЕсли все ОК — тихо.",
+        "height": 280,
+        "width": 460,
+        "color": 3
+      },
+      "id": "note",
+      "name": "Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-100, -120]
+    },
+    {
+      "parameters": {
+        "rule": { "interval": [{ "field": "minutes", "minutesInterval": 5 }] }
+      },
+      "id": "cron",
+      "name": "Every 5 min",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [-100, 280]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=http://n8n-main:5678/healthz",
+        "options": { "timeout": 5000 }
+      },
+      "id": "n8n",
+      "name": "Ping n8n",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [120, 180],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=http://evolution-api:8080/instance/connectionState/{{ $env.EVOLUTION_INSTANCE }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [{ "name": "apikey", "value": "={{ $env.EVOLUTION_API_KEY }}" }]
+        },
+        "options": { "timeout": 5000 }
+      },
+      "id": "evo",
+      "name": "Ping Evolution",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [120, 280],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://{{ $env.ALFACRM_HOSTNAME }}/v2api/auth/login",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Accept", "value": "application/json" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "bodyContentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"email\": \"{{ $env.ALFACRM_EMAIL }}\",\n  \"api_key\": \"{{ $env.ALFACRM_API_KEY }}\"\n}",
+        "options": { "timeout": 8000 }
+      },
+      "id": "alfa",
+      "name": "Ping AlfaCRM",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [120, 380],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineAll",
+        "options": {}
+      },
+      "id": "merge",
+      "name": "Merge",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [340, 280]
+    },
+    {
+      "parameters": {
+        "jsCode": "const status = {\n  n8n: $('Ping n8n').first().json.status === 'ok' ? 'OK' : 'DOWN',\n  evolution: ($('Ping Evolution').first().json.instance?.state) === 'open' ? 'OK' : 'DEGRADED',\n  alfacrm: $('Ping AlfaCRM').first().json.token ? 'OK' : 'DOWN'\n};\n\nconst issues = Object.entries(status).filter(([_, v]) => v !== 'OK');\n\nif (issues.length === 0) {\n  return [{ json: { healthy: true, status, skip: true } }];\n}\n\nconst text = [\n  '⚠️ *Health check degradation*',\n  '',\n  ...Object.entries(status).map(([k, v]) => `${v === 'OK' ? '✅' : '❌'} *${k}:* ${v}`),\n  '',\n  `_Time: ${$now.toISO()}_`\n].join('\\n');\n\nreturn [{\n  json: {\n    healthy: false,\n    status,\n    chat_id: $env.TELEGRAM_ALERT_CHAT_ID,\n    text,\n    parse_mode: 'Markdown'\n  }\n}];"
+      },
+      "id": "eval",
+      "name": "Evaluate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [560, 280]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "loose" },
+          "conditions": [
+            {
+              "id": "alert",
+              "leftValue": "={{ $json.healthy }}",
+              "rightValue": false,
+              "operator": { "type": "boolean", "operation": "equals", "singleValue": true }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if",
+      "name": "Need to alert?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [780, 280]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.telegram.org/bot{{ $env.TELEGRAM_BOT_TOKEN }}/sendMessage",
+        "sendBody": true,
+        "bodyContentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ chat_id: $json.chat_id, text: $json.text, parse_mode: $json.parse_mode }) }}",
+        "options": { "retry": { "maxTries": 3, "waitBetweenTries": 2000 } }
+      },
+      "id": "tg",
+      "name": "Telegram: Alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1000, 200]
+    }
+  ],
+  "connections": {
+    "Every 5 min": {
+      "main": [[
+        { "node": "Ping n8n", "type": "main", "index": 0 },
+        { "node": "Ping Evolution", "type": "main", "index": 0 },
+        { "node": "Ping AlfaCRM", "type": "main", "index": 0 }
+      ]]
+    },
+    "Ping n8n": { "main": [[{ "node": "Merge", "type": "main", "index": 0 }]] },
+    "Ping Evolution": { "main": [[{ "node": "Merge", "type": "main", "index": 1 }]] },
+    "Ping AlfaCRM": { "main": [[{ "node": "Merge", "type": "main", "index": 2 }]] },
+    "Merge": { "main": [[{ "node": "Evaluate", "type": "main", "index": 0 }]] },
+    "Evaluate": { "main": [[{ "node": "Need to alert?", "type": "main", "index": 0 }]] },
+    "Need to alert?": {
+      "main": [[{ "node": "Telegram: Alert", "type": "main", "index": 0 }], []]
+    }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1" },
+  "id": "healthcheck0001",
+  "versionId": "55555555-5555-5555-5555-555555555555",
+  "meta": {},
+  "pinData": {},
+  "tags": []
+}

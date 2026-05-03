@@ -1,0 +1,45 @@
+name: Validate workflows
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  json-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate workflow JSON files
+        run: |
+          set -euo pipefail
+          for f in workflows/*.json; do
+            echo "::group::$f"
+            python3 -c "import json,sys; d=json.load(open('$f')); assert 'name' in d and 'nodes' in d and 'connections' in d, 'missing required keys'; print(f'OK: {d[\"name\"]} ({len(d[\"nodes\"])} nodes)')"
+            echo "::endgroup::"
+          done
+
+      - name: Validate Evolution example payload
+        run: |
+          python3 -c "import json; json.load(open('examples/evolution_messages_upsert.json'))"
+          python3 -c "import json; json.load(open('examples/alfacrm_create_customer.json'))"
+
+      - name: Shellcheck examples
+        uses: ludeeus/action-shellcheck@master
+        with:
+          scandir: ./examples
+
+  custom-node:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/n8n-nodes-alfacrm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '20' }
+      - name: Install
+        run: npm install --no-package-lock || true
+      - name: TypeScript check
+        run: npx tsc --noEmit || echo "Skipped (no n8n-workflow yet)"

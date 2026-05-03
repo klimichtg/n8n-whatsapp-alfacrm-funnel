@@ -1,0 +1,114 @@
+{
+  "name": "Sub: Hot Lead Handoff → Telegram Channel",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## 🔥 Hot lead handoff\n\nКогда AI определяет лид как горячий (`action=handoff`), main workflow вызывает этот sub-workflow. Мы:\n\n1. Запрашиваем у AlfaCRM полную карточку лида (`/customer/index?id=X`)\n2. Берём последние 10 сообщений диалога из Postgres chat memory\n3. Форматируем плотную карточку с краткой выжимкой и deep-link на лида в AlfaCRM\n4. Постим в Telegram-канал отдела продаж с inline-кнопкой «Взять в работу»\n\nМенеджер видит лида в течение секунд, а не часов после следующего ручного заглядывания в CRM.",
+        "height": 300,
+        "width": 460,
+        "color": 4
+      },
+      "id": "note",
+      "name": "Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-100, -120]
+    },
+    {
+      "parameters": {
+        "events": ["workflow_call"],
+        "workflowInputs": {
+          "values": [
+            { "name": "customerId", "type": "number" },
+            { "name": "phone", "type": "string" },
+            { "name": "sessionId", "type": "string" },
+            { "name": "reason", "type": "string" },
+            { "name": "alfacrmToken", "type": "string" }
+          ]
+        }
+      },
+      "id": "trig",
+      "name": "When Called by Main",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [-100, 280]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://{{ $env.ALFACRM_HOSTNAME }}/v2api/{{ $env.ALFACRM_BRANCH_ID }}/customer/index",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "X-ALFACRM-TOKEN", "value": "={{ $json.alfacrmToken }}" },
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Accept", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "bodyContentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"id\": {{ $json.customerId }},\n  \"page\": 0\n}",
+        "options": {}
+      },
+      "id": "fetch",
+      "name": "AlfaCRM: Fetch Lead Card",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [120, 280]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT message FROM n8n_chat_histories WHERE session_id = $1 ORDER BY id DESC LIMIT 10",
+        "options": { "queryReplacement": "={{ $('When Called by Main').item.json.sessionId }}" }
+      },
+      "id": "history",
+      "name": "Postgres: Last 10 Messages",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [340, 280]
+    },
+    {
+      "parameters": {
+        "jsCode": "const customer = ($('AlfaCRM: Fetch Lead Card').item.json.items || [{}])[0];\nconst rows = items.map(i => i.json.message).reverse();\n\nconst dialog = rows.map(m => {\n  try {\n    const obj = typeof m === 'string' ? JSON.parse(m) : m;\n    const role = obj.type === 'human' ? '👤' : '🤖';\n    const text = (obj.data?.content || '').slice(0, 200);\n    return `${role} ${text}`;\n  } catch { return ''; }\n}).filter(Boolean).join('\\n');\n\nconst input = $('When Called by Main').item.json;\nconst dl = `https://${$env.ALFACRM_HOSTNAME}/index.php?route=client/index&id=${input.customerId}`;\n\nconst text = [\n  `🔥 *ГОРЯЧИЙ ЛИД — забери в работу*`,\n  ``,\n  `*Имя:* ${customer.name || '?'}`,\n  `*Телефон:* ${input.phone}`,\n  `*Этап:* ${customer.lead_status_id || '?'} → 4 (горячий)`,\n  `*Источник:* ${customer.lead_source_id || '?'}`,\n  ``,\n  `*Причина квалификации:* ${input.reason}`,\n  ``,\n  `*Последние сообщения:*`,\n  '```',\n  dialog || '(нет истории)',\n  '```',\n  ``,\n  `[Открыть в AlfaCRM](${dl})`\n].join('\\n');\n\nreturn [{\n  json: {\n    chat_id: $env.TELEGRAM_SALES_CHAT_ID,\n    text,\n    parse_mode: 'Markdown',\n    reply_markup: {\n      inline_keyboard: [[\n        { text: '✅ Взять в работу', callback_data: `take:${input.customerId}` },\n        { text: '👁 Открыть AlfaCRM', url: dl }\n      ]]\n    }\n  }\n}];"
+      },
+      "id": "fmt",
+      "name": "Format Lead Card",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [560, 280]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.telegram.org/bot{{ $env.TELEGRAM_BOT_TOKEN }}/sendMessage",
+        "sendBody": true,
+        "bodyContentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ chat_id: $json.chat_id, text: $json.text, parse_mode: $json.parse_mode, reply_markup: $json.reply_markup }) }}",
+        "options": {
+          "retry": { "maxTries": 3, "waitBetweenTries": 2000 }
+        }
+      },
+      "id": "tg",
+      "name": "Telegram: Send to Sales",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [780, 280]
+    }
+  ],
+  "connections": {
+    "When Called by Main": { "main": [[{ "node": "AlfaCRM: Fetch Lead Card", "type": "main", "index": 0 }]] },
+    "AlfaCRM: Fetch Lead Card": { "main": [[{ "node": "Postgres: Last 10 Messages", "type": "main", "index": 0 }]] },
+    "Postgres: Last 10 Messages": { "main": [[{ "node": "Format Lead Card", "type": "main", "index": 0 }]] },
+    "Format Lead Card": { "main": [[{ "node": "Telegram: Send to Sales", "type": "main", "index": 0 }]] }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1" },
+  "id": "hotleadhandoff1",
+  "versionId": "44444444-4444-4444-4444-444444444444",
+  "meta": {},
+  "pinData": {},
+  "tags": []
+}
